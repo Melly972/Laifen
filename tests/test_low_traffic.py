@@ -44,6 +44,7 @@ def fast_config():
         backoff_initial=timedelta(seconds=15),
         backoff_max=timedelta(seconds=40),
         unknown_hold=timedelta(seconds=20),
+        notify_wait=timedelta(0),
     )
 
 
@@ -80,6 +81,7 @@ class FakeDevice:
         self.client = FakeClient()
         self.connect_ok = True
         self.payload = None
+        self._status_epoch = 0
 
     async def connect(self, max_attempts=10):
         self.calls.append(("connect", max_attempts))
@@ -90,12 +92,19 @@ class FakeDevice:
         self.calls.append(("disconnect",))
         self.client.is_connected = False
 
+    async def start_notifications(self, max_attempts=5):
+        self.calls.append(("start_notifications", max_attempts))
+        if self.payload is not None:
+            self.result = dict(self.payload)
+            self._status_epoch += 1
+        return True
+
+    async def stop_notifications(self):
+        self.calls.append(("stop_notifications",))
+
     async def gatherdata(self):
         self.calls.append(("gatherdata",))
-        if self.payload is None:
-            return None
-        self.result = dict(self.payload)
-        return dict(self.payload)
+        raise AssertionError("low-traffic battery path must not GATT-read")
 
     def __getattr__(self, name):
         def banned(*_args, **_kwargs):
@@ -161,6 +170,7 @@ def test_production_defaults_are_hours_not_seconds():
     assert config.backoff_max <= timedelta(hours=12)
     assert config.unknown_hold >= timedelta(minutes=5)
     assert config.battery_interval >= config.backoff_max
+    assert timedelta(seconds=5) <= config.notify_wait <= timedelta(seconds=15)
 
 
 def test_startup_unknown_waits_then_allows_one_window():
@@ -277,7 +287,13 @@ def test_monitor_startup_does_not_connect_until_delay():
         device.payload = {"status": "Idle", "battery_level": 88}
         result = await monitor.async_tick(T0 + timedelta(seconds=15))
         assert result == "battery"
-        assert device.calls == [("connect", 1), ("gatherdata",), ("disconnect",)]
+        assert device.calls == [
+            ("connect", 1),
+            ("start_notifications", 1),
+            ("stop_notifications",),
+            ("disconnect",),
+        ]
+        assert "gatherdata" not in _names(device)
 
     asyncio.run(scenario())
 
@@ -321,7 +337,7 @@ def test_stale_running_rereads_existing_link_without_connect_or_disconnect():
         assert await monitor.async_tick(T0 + timedelta(seconds=19)) == "skipped"
         device.payload = {"status": "Running", "battery_level": 64}
         assert await monitor.async_tick(T0 + timedelta(seconds=20)) == "running_held"
-        assert device.calls == [("gatherdata",)]
+        assert device.calls == [("start_notifications", 1), ("stop_notifications",)]
         assert coordinator.updates[-1]["battery_level"] == 64
         assert ("disconnect",) not in _names(device)
         device.payload = {"status": "Idle", "battery_level": 64}
@@ -339,7 +355,11 @@ def test_unknown_payload_does_not_disconnect_or_lock_out():
         device.payload = None
         opened = T0 + timedelta(seconds=15)
         assert await monitor.async_tick(opened) == "unknown"
-        assert device.calls == [("connect", 1), ("gatherdata",)]
+        assert device.calls == [
+            ("connect", 1),
+            ("start_notifications", 1),
+            ("stop_notifications",),
+        ]
         assert coordinator.updates == []
         assert not monitor.policy.disconnect_allowed()
         assert await monitor.async_tick(opened + timedelta(seconds=19)) == "skipped"
@@ -414,7 +434,7 @@ def test_shutdown_cancels_timer_and_inflight_connect():
 
         monitor.attach(track, hass=None)
         due = T0 + timedelta(seconds=15)
-        monitor._scheduled(due)
+        scheduled = asyncio.create_task(monitor._scheduled(due))
         await device.started.wait()
         park = {}
         snapshots = {}
@@ -426,8 +446,7 @@ def test_shutdown_cancels_timer_and_inflight_connect():
         assert snapshots[device.address]["last_status"] is None
         # A later timer fire must not connect again.
         calls_after = len(device.calls)
-        monitor._scheduled(due + timedelta(seconds=30))
-        await asyncio.sleep(0)
+        await monitor._scheduled(due + timedelta(seconds=30))
         assert len(device.calls) == calls_after
         assert await monitor.async_unload(park, snapshots) == "already"
 
@@ -478,7 +497,14 @@ def test_running_unload_parks_the_device():
     asyncio.run(scenario())
 
 
-def test_gatherdata_is_a_read_and_default_connect_still_retries():
+def test_constructed_packet_parses_but_read_is_not_the_low_traffic_path():
+    """The parser accepts a hand-built 0xC1 packet.
+
+    Feeding those bytes to ``gatherdata`` only shows the decoder. It does
+    not show that a Wave Pro answers ``read_gatt_char`` with that packet.
+    The low-traffic module must not call that read.
+    """
+
     async def scenario():
         payload = bytearray(36)
         payload[2] = 42
@@ -504,6 +530,15 @@ def test_gatherdata_is_a_read_and_default_connect_still_retries():
         assert parsed["status"] == "Idle"
         assert [op[0] for op in client.ops] == ["read"]
         assert brush.result["battery_level"] == 42
+        low_text = (COMPONENT / "low_traffic.py").read_text()
+        assert "read_gatt_char(" not in low_text
+        assert ".gatherdata(" not in low_text
+        assert (
+            inspect.signature(LAIFEN.Laifen.start_notifications)
+            .parameters["max_attempts"]
+            .default
+            == 5
+        )
 
         captured = {}
 
@@ -580,7 +615,7 @@ def test_low_traffic_disconnect_does_not_schedule_aggressive_reconnect():
     asyncio.run(refused())
 
 
-def test_wave_pro_read_records_protocol_and_sends_no_motor_command():
+def test_wave_pro_status_comes_from_notification_not_a_read():
     async def scenario():
         payload = bytearray(36)
         payload[2] = 18
@@ -591,15 +626,20 @@ def test_wave_pro_read_records_protocol_and_sends_no_motor_command():
             address = "AA:BB:CC:DD:EE:09"
             name = "LFTB02-S-TEST"
 
-        brush = LAIFEN.Laifen(Device(), coordinator=None)
+        coordinator = FakeCoordinator()
+        brush = LAIFEN.Laifen(Device(), coordinator)
         assert brush._proto_version is None
         client = FakeClient()
 
         async def read(_uuid):
-            client.ops.append(("read", _uuid))
-            return packet
+            raise AssertionError("status notification path called read_gatt_char")
+
+        async def start_notify(uuid, callback):
+            client.ops.append(("start_notify", uuid))
+            callback(0, packet)
 
         client.read_gatt_char = read
+        client.start_notify = start_notify
         brush.client = client
 
         async def connect(max_attempts=10):
@@ -612,7 +652,6 @@ def test_wave_pro_read_records_protocol_and_sends_no_motor_command():
         brush.turn_on = _forbid_motor(brush, "turn_on")
         brush.turn_off = _forbid_motor(brush, "turn_off")
 
-        coordinator = FakeCoordinator()
         monitor = LOW.LowTrafficMonitor(
             address=brush.address,
             device=brush,
@@ -624,13 +663,14 @@ def test_wave_pro_read_records_protocol_and_sends_no_motor_command():
         due = T0 + timedelta(seconds=15)
         assert await monitor.async_tick(due) == "running_held"
         assert brush._proto_version == "v2pro"
-        assert [op[0] for op in client.ops] == ["read"]
+        assert brush._status_epoch == 1
+        assert [op[0] for op in client.ops] == ["start_notify", "stop_notify"]
+        assert client.ops[0][1] == LAIFEN.CHARACTERISTIC_UUID
         assert ("disconnect",) not in [call[0] for call in brush.calls]
         assert coordinator.updates[-1]["battery_level"] == 18
         assert coordinator.updates[-1]["status"] == "Running"
-        # Still inside the fresh window: no second read and no disconnect.
         assert await monitor.async_tick(due + timedelta(seconds=5)) == "skipped"
-        assert [op[0] for op in client.ops] == ["read"]
+        assert [op[0] for op in client.ops] == ["start_notify", "stop_notify"]
 
     asyncio.run(scenario())
 

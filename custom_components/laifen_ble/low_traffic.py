@@ -2,12 +2,16 @@
 
 The default integration polls about once a second, and a dropped link
 schedules an aggressive reconnect. This module is used only when a config
-entry opts in. It decides when a single GATT read is allowed. It never
-turns the motor on or off, never parses advertisements as battery data,
-and never disconnects while status is Running or unknown.
+entry opts in. It decides when one notification subscription is allowed.
 
-Home Assistant is not imported here so the decision logic can be tested
-with mocked Bluetooth objects.
+Wave Pro status in this integration is a notification on ``0000ff02``
+(periodic ``0xC1-03`` and change ``0x81-03``). A solitary ``read_gatt_char``
+is not used here. Nothing in this tree shows that the brush returns that
+status packet from a read while notifications are off, and the coordinator
+stopped adding those reads because they were disruptive during brushing.
+
+This module never turns the motor on or off, never parses advertisements
+as battery data, and never disconnects while status is Running or unknown.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ RUNNING = "Running"
 IDLE = "Idle"
 
 # One local timer. It does not touch Bluetooth unless a tick is allowed
-# to connect or to read a link that is already open.
+# to open one short notification window.
 CHECK_INTERVAL = timedelta(seconds=60)
 STARTUP_DELAY = timedelta(minutes=15)
 STALE_RUNNING = timedelta(minutes=20)
@@ -33,6 +37,9 @@ BATTERY_INTERVAL = timedelta(hours=6)
 BACKOFF_INITIAL = timedelta(minutes=15)
 BACKOFF_MAX = timedelta(hours=6)
 UNKNOWN_HOLD = timedelta(minutes=20)
+# Client timeout only. laifen.py describes the full status notification
+# at about a 5 second cadence, and also notes bursts faster than that.
+STATUS_NOTIFY_TIMEOUT = timedelta(seconds=8)
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,7 @@ class LowTrafficConfig:
     backoff_initial: timedelta = BACKOFF_INITIAL
     backoff_max: timedelta = BACKOFF_MAX
     unknown_hold: timedelta = UNKNOWN_HOLD
+    notify_wait: timedelta = STATUS_NOTIFY_TIMEOUT
 
 
 def production_config() -> LowTrafficConfig:
@@ -258,10 +266,11 @@ def sensor_refresh_allowed(low_traffic: bool) -> bool:
 class LowTrafficMonitor:
     """Run the policy against one device object.
 
-    ``device`` must provide ``connect(max_attempts=...)``, ``gatherdata``,
-    ``disconnect``, ``client``, ``result``, and ``address``. ``gatherdata``
-    is a GATT read. This class never calls ``turn_on``, ``turn_off``,
-    ``start_notifications``, or a scanner.
+    ``device`` must provide ``connect(max_attempts=...)``,
+    ``start_notifications(max_attempts=...)``, ``stop_notifications``,
+    ``disconnect``, ``client``, ``result``, ``_status_epoch``, and
+    ``address``. Status comes from the notification callback. This class
+    never calls ``turn_on``, ``turn_off``, ``read_gatt_char``, or a scanner.
     """
 
     def __init__(
@@ -300,12 +309,21 @@ class LowTrafficMonitor:
         except Exception:  # noqa: BLE001 - timer may already be gone on unload
             _LOGGER.debug("Low-traffic timer for %s was already removed", self.address)
 
-    def _scheduled(self, now: datetime) -> None:
+    async def _scheduled(self, now: datetime) -> None:
+        """Timer callback. Home Assistant awaits this on the event loop.
+
+        A synchronous callback would be pushed to the executor, and
+        ``asyncio.create_task`` would then fail with no running loop.
+        """
+
         if self._closed:
             return
-        if self._task is not None and not self._task.done():
-            return
-        self._task = asyncio.create_task(self.async_tick(now))
+        self._task = asyncio.current_task()
+        try:
+            await self.async_tick(now)
+        finally:
+            if self._task is asyncio.current_task():
+                self._task = None
 
     def note_link_lost(self, intentional: bool = False, now: datetime | None = None) -> None:
         """Called from the BLE disconnect callback. Does not reconnect."""
@@ -345,7 +363,7 @@ class LowTrafficMonitor:
     async def _read(self, now: datetime, *, connect: bool) -> str:
         if connect:
             _LOGGER.info(
-                "Low-traffic %s: one GATT connect (max_attempts=1), no motor command",
+                "Low-traffic %s: one connect (max_attempts=1) for a status notification, no motor command",
                 self.address,
             )
             ok = await self.device.connect(max_attempts=1)
@@ -366,18 +384,17 @@ class LowTrafficMonitor:
                 self.policy.note_link_lost(now, intentional=False)
                 return "link_already_down"
             _LOGGER.info(
-                "Low-traffic %s: reading battery on the link already open",
+                "Low-traffic %s: subscribing for one status notification on the open link",
                 self.address,
             )
 
-        parsed = await self.device.gatherdata()
+        parsed = await self._await_status_notification()
         status = None
         battery = None
         if isinstance(parsed, dict):
             status = parsed.get("status")
             battery = parsed.get("battery_level")
         self.policy.note_result(status, battery, now)
-        self._remember_wave_pro(parsed)
 
         client = getattr(self.device, "client", None)
         if not client or not getattr(client, "is_connected", False):
@@ -386,7 +403,7 @@ class LowTrafficMonitor:
         if isinstance(parsed, dict) and battery is not None:
             await self._publish(parsed)
             _LOGGER.info(
-                "Low-traffic %s: battery %s%% status %s; next new connect %s",
+                "Low-traffic %s: notification battery %s%% status %s; next new connect %s",
                 self.address,
                 battery,
                 status,
@@ -394,13 +411,13 @@ class LowTrafficMonitor:
             )
         elif status == RUNNING:
             _LOGGER.info(
-                "Low-traffic %s: status Running; not disconnecting and not reconnecting until %s",
+                "Low-traffic %s: status Running; subscription stopped, link left up until %s",
                 self.address,
                 self.policy.next_attempt_at.isoformat(),
             )
         else:
             _LOGGER.info(
-                "Low-traffic %s: GATT read did not yield a battery (status=%s); next attempt %s",
+                "Low-traffic %s: no status notification with a battery (status=%s); next attempt %s",
                 self.address,
                 status,
                 self.policy.next_attempt_at.isoformat(),
@@ -414,22 +431,52 @@ class LowTrafficMonitor:
             return "running_held"
         return "unknown"
 
-    def _remember_wave_pro(self, parsed) -> None:
-        """Record a Wave Pro parse without transmitting a command.
+    async def _await_status_notification(self) -> dict | None:
+        """Subscribe, wait for one status notification, then unsubscribe.
 
-        Protocol detection normally happens when a notification arrives.
-        This mode does not subscribe, so a later manual control would
-        otherwise assume the V1 command set. Setting the marker does not
-        read or write GATT.
+        Unsubscribing ends the push stream, including brushing telemetry.
+        It is not a disconnect and not a motor command. If the brush was
+        Running, the caller still does not disconnect.
         """
 
-        if not isinstance(parsed, dict):
-            return
-        if "deep_clean" not in parsed and "over_pressure" not in parsed:
-            return
-        if getattr(self.device, "_proto_version", "unset") is not None:
-            return
-        self.device._proto_version = "v2pro"
+        epoch = getattr(self.device, "_status_epoch", 0)
+        starter = getattr(self.device, "start_notifications", None)
+        try:
+            if starter is None:
+                return None
+            try:
+                started = await starter(max_attempts=1)
+            except TypeError:
+                started = await starter()
+            if started is False:
+                return None
+            timeout = self.policy.config.notify_wait.total_seconds()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(0.0, timeout)
+            while True:
+                sample = self._fresh_status(epoch)
+                if sample is not None:
+                    return sample
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                await asyncio.sleep(min(0.05, remaining))
+        finally:
+            stopper = getattr(self.device, "stop_notifications", None)
+            if stopper is not None:
+                await stopper()
+
+    def _fresh_status(self, epoch: int) -> dict | None:
+        if getattr(self.device, "_status_epoch", 0) == epoch:
+            return None
+        current = getattr(self.device, "result", None)
+        if not isinstance(current, dict):
+            return None
+        status = current.get("status")
+        battery = current.get("battery_level")
+        if status not in (RUNNING, IDLE) or battery is None:
+            return None
+        return current
 
     async def _publish(self, parsed: dict) -> None:
         result = getattr(self.device, "result", None) or parsed
@@ -453,8 +500,9 @@ class LowTrafficMonitor:
         self._closed = True
         self.detach()
         task = self._task
+        current = asyncio.current_task()
         self._task = None
-        if task is not None and not task.done():
+        if task is not None and task is not current and not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task

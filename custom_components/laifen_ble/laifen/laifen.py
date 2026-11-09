@@ -160,6 +160,8 @@ class Laifen:
         # Set around an intentional disconnect so a low-traffic entry does
         # not treat that callback as a dropped brushing session.
         self._intentional_disconnect = False
+        # Bumps on each parsed status notification (not telemetry, not reads).
+        self._status_epoch = 0
 
         # ── State tracking ────────────────────────────────────────────────
         # mode_index: byte[4] echoes the last-written value for ANY command,
@@ -367,19 +369,26 @@ class Laifen:
     # Notifications
     # ──────────────────────────────────────────────────────────────────
 
-    async def start_notifications(self):
+    async def start_notifications(self, max_attempts: int = 5):
+        """Subscribe to the status characteristic. Default retry count is unchanged.
+
+        Low-traffic mode passes ``max_attempts=1``. A plain GATT read is not
+        a substitute: Wave Pro status in this file arrives as notifications.
+        """
+
         if not self.client or not self.client.is_connected:
-            return
-        for attempt in range(5):
+            return False
+        for _attempt in range(max_attempts):
             try:
                 await self.client.start_notify(CHARACTERISTIC_UUID, self.notification_handler)
-                return
+                return True
             except BleakError as e:
                 if "Notifications are already enabled" in str(e):
-                    return
+                    return True
                 await asyncio.sleep(1)
         if self.coordinator:
             self.coordinator.device_asleep = True
+        return False
 
     async def stop_notifications(self):
         async with self.lock:
@@ -430,6 +439,7 @@ class Laifen:
             self._proto_version = "v1"
             parsed = self._parse_v1(data)
             if parsed:
+                self._status_epoch += 1
                 self.result = parsed
                 self.coordinator.device_asleep = False
                 self.coordinator.async_set_updated_data(self.result)
@@ -450,6 +460,17 @@ class Laifen:
         ):
             self._proto_version = "v2pro"
             parsed = self._parse_v2pro_packet(data)
+            if (
+                isinstance(parsed, dict)
+                and len(data) > 2
+                and data[1] in (V2PRO_TYPE_POLL, V2PRO_TYPE_STATUS)
+                and data[2] == V2PRO_SUBCMD_STATUS
+                and parsed.get("battery_level") is not None
+                and parsed.get("status") in ("Running", "Idle")
+            ):
+                # Count repeats too. Identical payloads skip the coordinator
+                # push below, and the low-traffic waiter still has to see them.
+                self._status_epoch += 1
             if parsed:
                 self.coordinator.device_asleep = False
                 # Only push an update to HA if something we actually track

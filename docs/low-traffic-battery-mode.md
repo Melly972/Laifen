@@ -1,6 +1,10 @@
 # Low-traffic battery monitoring (patch `low-traffic-battery-1`)
 
-This note is for the installed Laifen BLE integration **3.0.4** on the Melly972 fork. It describes an optional, per-entry battery reader. It does not claim that Home Assistant disconnects are what stop the Wave Pro motor. That link was not proven.
+**Deployment verdict: safe experimental. Not ready for a production install.**
+
+The checkbox defaults to off, so copying the files and restarting Core without enabling it keeps the 3.0.4 Bluetooth session. Enabling it is an experiment. Do not install this onto the live Home Assistant host until a supervised test has shown that one short notification window returns a battery value and does not stop the motor. That test has not been run. This workspace did not connect to the brushes, the proxy, or Home Assistant.
+
+This note is for the installed Laifen BLE integration **3.0.4** on the Melly972 fork. It does not claim that Home Assistant disconnects are what stop the Wave Pro motor. That link was not proven.
 
 The patch does not remove the integration, does not delete entities, and does not change sensor unique IDs. With the new checkbox left off, the Bluetooth behaviour is the 3.0.4 behaviour.
 
@@ -20,7 +24,7 @@ These are code-path observations, not a diagnosis of the motor.
 - `_handle_disconnect` always schedules another `_aggressive_reconnect()` (default 10 attempts).
 - A passive advertisement for a configured address calls `_async_device_recovery`, which connects when the link is down. That path can also call `set_ble_device()`, and that helper disconnects a client that is still up.
 - Every sensor entity registers its own 1-second `async_track_time_interval`. That callback calls `coordinator.async_request_refresh()`. Home Assistant debounces overlapping refreshes, but the cadence stays about one second. The Wave Pro guard does not turn this loop off.
-- Battery for the Wave Pro is byte `payload[2]` of a GATT status packet (`0xC1`/`0x81` subcommand `0x03`). This tree has no parser that reads battery from an advertisement. A sleeping brush often will not accept GATT at all.
+- Battery for the Wave Pro, in this source, is byte `payload[2]` of a status notification (`0xC1-03` or `0x81-03`) on characteristic `0000ff02`. The manifest class is `local_push`. The coordinator comment says those notifications are the status stream, and that an extra `read_gatt_char` on top of them during brushing was enough to overwhelm the link. `gatherdata()` can decode a buffer that already looks like that packet. Nothing in this tree shows a capture where a read, with notifications off, returned that buffer. A plain read is not a proven battery method. This patch does not use one. A sleeping brush often will not accept a connection at all.
 
 The Pi radio is far from the bathroom and the ESPHome proxy is already described as unreliable. Either of those can drop the link with no help from this integration. A reconnect storm can still sit on top of that and line up with several motor stops in one brushing. This patch reduces how often the opted-in entry starts that storm. It cannot prove the storm was the cause, and it cannot make the radio or the proxy reliable.
 
@@ -38,15 +42,15 @@ When the checkbox is on for an entry:
 | Startup or live status Running | No new connect and no explicit disconnect for 20 minutes after that observation. |
 | Running observation older than 20 minutes, link still up | One GATT **read** on that same link. No new connect. No disconnect if the read still says Running. |
 | Running observation older than 20 minutes, link down | One connect, `max_attempts=1`. |
-| Read says Idle and includes a battery byte | Update the existing battery value, disconnect, wait 6 hours. |
-| Read says Running | Keep the link. Do not disconnect. Do not subscribe to notifications. Do not reconnect while the observation is fresh. |
-| Read has no usable battery | Do not disconnect (status is not known to be Idle). Retry the read on the open link after 20 minutes, or a single connect later if the link has dropped. |
+| Status notification says Idle and includes a battery byte | Update the existing battery value, stop notifications, disconnect, wait 6 hours. |
+| Status notification says Running | Stop the notification subscription (this is not a motor command and not a link disconnect). Leave the GATT link up. Do not reconnect while the observation is fresh. |
+| No status notification within 8 seconds | Do not invent a battery. Do not disconnect. The 8 seconds is only a client timeout around the ~5 second full-status cadence described in `laifen.py`. |
 | Connect fails (asleep, out of range, proxy) | Wait 15 minutes, then 30, 60, 120, 240, then 6 hours. The wait never grows past 6 hours, so a failure does not lock the entry out. |
 | Advertisement | Ignored. No connect, and advertisement bytes are not treated as a battery reading. |
 | Sensor tick | The 1-second coordinator refresh is not requested. The synthetic timer sensor still counts locally. |
 | Motor on/off | Never sent by this reader. `turn_on` / `turn_off` are not on this path. |
 
-The local check timer is 60 seconds. Most ticks only look at the schedule. They do not scan and do not connect.
+The local check timer is 60 seconds. Most ticks only look at the schedule. They do not scan and do not connect. A due attempt calls `connect(max_attempts=1)`, `start_notifications(max_attempts=1)`, waits for the existing notification parser to count a status packet, then `stop_notifications`. It does not call `read_gatt_char`, `turn_on`, or `turn_off`.
 
 A successful read still writes `battery_level` on the same result dict the battery sensor already uses. Unique id stays `{MAC}_battery_level`. Device class stays battery, unit stays `%`. The 20% notification, whether it is a battery threshold or an automation on that entity, keeps the same entity. The value can sit at the last good reading for hours, and it can sit there longer when the brush is asleep and the connect fails. The notification fires when a later read crosses the threshold, not at the minute the cell actually crosses it.
 
@@ -54,7 +58,9 @@ An integration reload keeps the in-memory schedule (next attempt, failure count,
 
 ## What this does not fix
 
-- One connect can still land while someone is brushing. The reader cannot see a Running motor until it has connected or until a previous status is still fresh. A brush that starts during the 15-minute startup delay, or during the 6-hour gap, can overlap that single attempt.
+- The notification window is the path this source already uses for status. It is still untested on this Wave Pro. If the brush does not send `0xC1-03` / `0x81-03` within 8 seconds of subscribing, the battery entity stays on its previous value. That previous value is the integration's existing cache, not a new reading, and this patch does not prove the cache is still true.
+- Stopping notifications at the end of the window is how the attempt avoids leaving the brushing telemetry stream running. Whether `stop_notify` or the following Idle disconnect affects the motor is unknown. A Running result does not disconnect.
+- One connect can still land while someone is brushing. The reader cannot see a Running motor until it has connected or until a previous status is still fresh. A brush that starts during the 15-minute startup delay, or during the 6-hour gap, can overlap that single attempt. During the wait, brushing telemetry can flow for up to 8 seconds.
 - If a connect or a disconnect itself stops the motor, that one attempt can still stop it once. The aim is to stop the 5–6 reconnects per session, not to promise zero interaction.
 - After a Running read the link is left up, because an explicit disconnect might be the thing that stops the motor. A link that stays up, plus a GATT read every 20 minutes while the status byte stays Running, can still disturb the brush. If the status byte never returns to Idle, that held link continues. That is an intentional tradeoff, not a silent success.
 - Eléa's entry is unchanged. If both brushes share the flaky proxy, Eléa's one-second session and active scans still run. This patch will not quiet that traffic.
@@ -114,17 +120,18 @@ If HACS is tracking `https://github.com/UrbanTechIO/Laifen`, an update replaces 
 
 ## Tests and hardware limits
 
-`tests/test_low_traffic.py` was run with pytest on this workspace: **22 passed**. Bluetooth was mocked. Home Assistant was not imported and was not contacted. No brush, proxy, or Core instance was used.
+Two suites, both local, neither pointed at a brush or a Home Assistant host:
 
-Covered with fakes: startup unknown, cached Running, cached Idle, connect failure and capped backoff, Running → link drop → stale → Idle battery update, stale read on a link that is already open (no second connect, no disconnect while Running), unparsed GATT (no disconnect, no lockout), overlapping ticks (one connect), timer cancellation and unload, Idle unload disconnect plus a reload that keeps the deadline, Running unload that parks the device, a real Wave Pro status packet that only issues a GATT read, default `connect()` still using 10 attempts, and a low-traffic disconnect that does not schedule `_aggressive_reconnect`.
+- `tests/test_low_traffic.py` — schedule, backoff, Running hold, stale retry, timer cancel, and a real `notification_handler` fed a constructed `0xC1-03` buffer. That buffer proves the parser. It does not prove the brush sends it.
+- `tests/test_ha_low_traffic.py` — imports the real config flow, coordinator, setup, and sensor modules under Home Assistant **2025.1.4**. USB monitoring is stubbed (no udev). Adapter discovery is the test plugin's mock. `establish_connection` is replaced so no socket opens. The tests check: Eléa's entry still connects with 10 attempts and a 1-second coordinator; Célian's entry does not connect at startup, does not connect when its coordinator is refreshed, does not connect from an advertisement, and does not active-scan; a timer callback after the startup hold subscribes once on `0000ff02`, does not read or write, and the battery entity (`{MAC}_battery_level`, `%`) becomes `21` from the injected notification; the options form reloads that entry back to the 1-second path; reloading the quiet entry cancels its timer and still does not connect.
 
-Not covered, and still required on the real brushes before treating the symptom as gone:
+Not covered, and required before this is anything but an experiment:
 
-- Whether a single GATT connect or a held link stops the Wave Pro motor.
-- Whether `read_gatt_char` on characteristic `0000ff02` returns the 36-byte status payload on this firmware when notifications are not enabled. If it does not, battery will not refresh and the mode will retry later. It will not fall back to motor commands or to the notification flood.
-- Behaviour through the ESPHome proxy and at bathroom distance.
-- Interaction with Eléa's unchanged one-second session on the same proxy.
-- The 20% notification firing on a real state change after a multi-hour gap.
-- Core restart and integration reload while the motor is actually running.
+- Whether subscribing, unsubscribing, or disconnecting while Idle stops the motor.
+- Whether this Wave Pro actually emits a status notification within 8 seconds when it is awake and not already in the normal session.
+- A solitary `read_gatt_char` of `0000ff02`. The low-traffic path does not call it, because this source does not show that a read returns status.
+- The ESPHome proxy, bathroom distance, and Eléa's session sharing that proxy.
+- The 20% notification on a real multi-hour gap. The automated test only shows an injected notification reaching the existing entity.
+- Core restart while the motor is running.
 
-Until those are tried, the honest result is: Célian's entry can be made much quieter, on a schedule that gives up rather than reconnects during a fresh Running state. That is not the same as a fix for the motor stopping.
+Until those are tried, hold the production install. The quiet schedule is the right shape for an experiment. It is not evidence the motor will keep running, and it is not evidence a sleeping brush will still yield a battery.
