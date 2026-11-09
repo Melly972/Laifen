@@ -157,6 +157,9 @@ class Laifen:
         self._reconnecting   = asyncio.Lock()
         self._proto_version  = None        # "v1" or "v2"
         self._brushing_active = False      # V2 only
+        # Set around an intentional disconnect so a low-traffic entry does
+        # not treat that callback as a dropped brushing session.
+        self._intentional_disconnect = False
 
         # ── State tracking ────────────────────────────────────────────────
         # mode_index: byte[4] echoes the last-written value for ANY command,
@@ -205,7 +208,7 @@ class Laifen:
         ]
         return found or None
 
-    async def connect(self):
+    async def connect(self, max_attempts: int = 10):
         if self.client and self.client.is_connected:
             return True
 
@@ -215,7 +218,7 @@ class Laifen:
                 self.ble_device,
                 self.name,
                 disconnected_callback=self._handle_disconnect,
-                max_attempts=10,
+                max_attempts=max_attempts,
             )
             if self.coordinator:
                 self.coordinator.device_asleep = False
@@ -276,18 +279,36 @@ class Laifen:
         self.client.set_disconnected_callback(self._handle_disconnect)
 
     async def disconnect(self):
-        if self.client and self.client.is_connected:
-            try:
-                await self.stop_notifications()
-                await self.client.disconnect()
-                _LOGGER.debug(f"Disconnected {self.ble_device.address}")
-            except BleakError as e:
-                _LOGGER.debug(f"Error during disconnect: {e}")
-            finally:
-                self.client = None
+        if not self.client or not self.client.is_connected:
+            return
+        self._intentional_disconnect = True
+        try:
+            await self.stop_notifications()
+            await self.client.disconnect()
+            _LOGGER.debug(f"Disconnected {self.ble_device.address}")
+        except BleakError as e:
+            _LOGGER.debug(f"Error during disconnect: {e}")
+        finally:
+            self.client = None
+            self._intentional_disconnect = False
+
+    def _low_traffic_active(self) -> bool:
+        return bool(self.coordinator and getattr(self.coordinator, "low_traffic", False))
 
     def _handle_disconnect(self, client):
         _LOGGER.debug(f"{self.ble_device.address} disconnected.")
+        intentional = self._intentional_disconnect
+        if self._low_traffic_active():
+            # Do not schedule _aggressive_reconnect. A reconnect loop is the
+            # traffic this mode exists to avoid, and disconnecting again
+            # while Running is intentionally not done here either.
+            if self.coordinator:
+                self.coordinator.device_asleep = False
+                self.coordinator.async_set_updated_data(self.result or {})
+                monitor = getattr(self.coordinator, "monitor", None)
+                if monitor is not None:
+                    monitor.note_link_lost(intentional=intentional)
+            return
         if self.coordinator:
             self.coordinator.device_asleep = False
             # Push a coordinator update immediately so the Connection binary
@@ -297,6 +318,11 @@ class Laifen:
             asyncio.create_task(self._aggressive_reconnect())
 
     async def _aggressive_reconnect(self, max_attempts=10, initial_delay=1):
+        if self._low_traffic_active():
+            _LOGGER.debug(
+                "[%s] low-traffic mode: refusing aggressive reconnect", self.address
+            )
+            return False
         async with self._reconnecting:
             # Another caller may have already reconnected us while we were
             # waiting for the lock (e.g. _handle_disconnect's background
@@ -365,27 +391,28 @@ class Laifen:
                 return
 
     async def gatherdata(self):
+        """Read the status characteristic once. Does not write and does not notify."""
+
         if not self.client or not self.client.is_connected:
-            return
+            return None
         try:
             raw      = await self.client.read_gatt_char(CHARACTERISTIC_UUID)
             data_str = raw.hex()
+            parsed = None
             if data_str.startswith("aa0a021") and len(data_str) >= 50:
                 parsed = self._parse_v1(raw)
-                if parsed:
-                    self.result = parsed
             elif len(raw) >= 2 and raw[0] == PROTO_V2_MAGIC and raw[1] in (
                 V2PRO_TYPE_POLL, V2PRO_TYPE_STATUS, V2PRO_TYPE_ACK, V2PRO_TYPE_READY
             ):
                 parsed = self._parse_v2pro_packet(raw)
-                if parsed:
-                    self.result = parsed
             elif len(raw) > 0 and raw[0] == PROTO_V2_MAGIC:
                 parsed = self._parse_v2_packet(raw)
-                if parsed:
-                    self.result = parsed
+            if parsed:
+                self.result = parsed
+            return parsed
         except Exception as e:
             _LOGGER.debug(f"[gatherdata] Error: {e}")
+            return None
 
     def notification_handler(self, sender, data):
         if not self.coordinator:
