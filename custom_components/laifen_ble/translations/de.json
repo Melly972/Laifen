@@ -16,6 +16,17 @@
       }
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Laifen-BLE-Optionen",
+        "description": "Die sparsame Akkuüberwachung gilt nur für diesen Konfigurationseintrag. Sie liest den Akku selten per GATT und nutzt nicht die normale Bluetooth-Sitzung im Sekundentakt. Für jede andere Zahnbürste ausgeschaltet lassen. Der Akkuwert kann stundenlang der letzte bekannte Wert bleiben, und eine schlafende Bürste antwortet möglicherweise nicht.",
+        "data": {
+          "low_traffic_battery_mode": "Sparsame Akkuüberwachung"
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "status": {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import async_timeout
+from datetime import datetime, timedelta, timezone
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
@@ -12,13 +13,18 @@ from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
 from bleak import BleakError, BleakClient, BleakScanner
 from .laifen import Laifen
-from datetime import timedelta
-
-from .const import DEVICE_TIMEOUT, DOMAIN, UPDATE_SECONDS
+from .const import CONF_LOW_TRAFFIC_BATTERY, DEVICE_TIMEOUT, DOMAIN, UPDATE_SECONDS
+from .low_traffic import (
+    PATCH_ID,
+    LowTrafficMonitor,
+    advertisement_should_connect,
+    production_config,
+)
 from .models import LaifenData, DEVICE_REGISTRY, DEVICE_SIGNAL
 
 PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH, Platform.NUMBER, Platform.SELECT, Platform.BINARY_SENSOR]
@@ -33,12 +39,19 @@ LAST_KNOWN_STORE_VERSION = 1
 LAST_KNOWN_FILENAME = f"{DOMAIN}_last_known.json"
 
 class LaifenCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass: HomeAssistant, laifen: Laifen, device_address: str):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        laifen: Laifen,
+        device_address: str,
+        *,
+        low_traffic: bool = False,
+    ):
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=UPDATE_SECONDS),
+            update_interval=None if low_traffic else timedelta(seconds=UPDATE_SECONDS),
         )
         self.laifen = laifen
         self.device_address = device_address
@@ -47,9 +60,20 @@ class LaifenCoordinator(DataUpdateCoordinator):
         self.device_asleep = False
         self._reconnecting = asyncio.Lock()
         self._store = Store(hass, LAST_KNOWN_STORE_VERSION, LAST_KNOWN_FILENAME)
+        # Default False. Only the options checkbox for this entry sets it.
+        self.low_traffic = low_traffic
+        self.monitor: LowTrafficMonitor | None = None
 
 
     async def _async_update_data(self):
+        if self.low_traffic:
+            # Keep entity state stable if something still asks for a refresh.
+            # Do not call _aggressive_reconnect from this path.
+            if self.laifen and self.laifen.result:
+                return self.laifen.result
+            restored = await self._async_restore_data()
+            return restored or {}
+
         if self.device_asleep:
             _LOGGER.debug(f"{self.device_address} is asleep. Skipping update.")
             restored = await self._async_restore_data()
@@ -142,6 +166,57 @@ class LaifenCoordinator(DataUpdateCoordinator):
                 await asyncio.sleep(30)
 
 
+def _entry_low_traffic(entry: ConfigEntry) -> bool:
+    return bool(entry.options.get(CONF_LOW_TRAFFIC_BATTERY, False))
+
+
+def _arm_low_traffic(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: LaifenCoordinator,
+    laifen: Laifen,
+    restored: dict | None,
+) -> None:
+    """Start the slow battery timer. Does not connect and does not scan."""
+
+    now = datetime.now(timezone.utc)
+    source = laifen.result or restored or {}
+    status = source.get("status") if isinstance(source, dict) else None
+    link_up = bool(laifen.client and getattr(laifen.client, "is_connected", False))
+    monitor = LowTrafficMonitor(
+        address=laifen.address,
+        device=laifen,
+        coordinator=coordinator,
+        config=production_config(),
+        now=now,
+    )
+    snapshots = hass.data[DOMAIN].setdefault("low_traffic_snapshots", {})
+    snapshot = getattr(laifen, "low_traffic_snapshot", None) or snapshots.get(laifen.address)
+    if snapshot:
+        monitor.policy.restore(snapshot, now, link_up=link_up)
+        _LOGGER.info(
+            "%s low-traffic schedule restored for %s; next BLE attempt %s (status=%s)",
+            PATCH_ID,
+            laifen.address,
+            monitor.policy.next_attempt_at.isoformat(),
+            monitor.policy.last_status,
+        )
+    else:
+        monitor.policy.note_startup_cache(status, now, link_up=link_up)
+        _LOGGER.info(
+            "%s low-traffic battery mode on for %s; no BLE connect until %s "
+            "(startup status=%s). Default one-second polling stays off for this entry only.",
+            PATCH_ID,
+            laifen.address,
+            monitor.policy.next_attempt_at.isoformat(),
+            status,
+        )
+    monitor.attach(async_track_time_interval, hass)
+    coordinator.monitor = monitor
+    coordinator.low_traffic = True
+    entry.async_on_unload(monitor.detach)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Laifen for multiple devices, restoring stored devices and ensuring passive Bluetooth detection."""
 
@@ -164,19 +239,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.debug(f"[Startup] BLE device {addr} not found (likely sleeping). Will restore passively.")
         ble_devices.append(device)
 
+    low_traffic = _entry_low_traffic(entry)
+    held_links = hass.data[DOMAIN].setdefault("held_links", {})
+
     for addr, ble_device in zip(addresses, ble_devices):
         restored = None  # ✅ Always define restored
+        if not low_traffic:
+            # The option was on and a Running link was left up. Normal mode
+            # always disconnects, so drop that held client before building
+            # a new one. Otherwise two clients would target one brush.
+            abandoned = held_links.pop(addr, None)
+            if abandoned is not None:
+                _LOGGER.info(
+                    "Low-traffic mode is off for %s; disconnecting the link it was holding",
+                    addr,
+                )
+                try:
+                    await abandoned.disconnect()
+                except Exception as err:
+                    _LOGGER.debug("Disconnect of held link %s failed: %s", addr, err)
+        parked = held_links.pop(addr, None) if low_traffic else None
 
-        if addr in entry_data and isinstance(entry_data[addr], LaifenData):
+        if parked is not None:
+            # Integration reload left this object connected on purpose.
+            # Reuse it instead of constructing a second client.
+            laifen = parked
+            coordinator = LaifenCoordinator(hass, laifen, addr, low_traffic=True)
+            laifen.coordinator = coordinator
+            entry_data[addr] = LaifenData(entry.title, laifen, coordinator)
+            DEVICE_REGISTRY.setdefault(entry.entry_id, {})[addr] = entry_data[addr]
+            async_dispatcher_send(hass, f"{DEVICE_SIGNAL}_{entry.entry_id}_{addr}")
+            restored = laifen.result or await coordinator._async_restore_data()
+            if restored:
+                coordinator.data = restored
+                coordinator.async_set_updated_data(restored)
+                laifen.result = restored
+            has_cached_data = restored is not None
+        elif addr in entry_data and isinstance(entry_data[addr], LaifenData):
             # Device already initialized
             laifen = entry_data[addr].device
             coordinator = entry_data[addr].coordinator
+            coordinator.low_traffic = low_traffic
+            if low_traffic:
+                coordinator.update_interval = None
             has_cached_data = True  # Because we have previous data for this device
             restored = await coordinator._async_restore_data()
             _LOGGER.debug(f"Restored Laifen {addr} from previous data.")
         else:
             # First time initialization
-            coordinator = LaifenCoordinator(hass, None, addr)
+            coordinator = LaifenCoordinator(hass, None, addr, low_traffic=low_traffic)
             laifen = Laifen(ble_device or MockBLEDevice(addr), coordinator)
             coordinator.laifen = laifen
             entry_data[addr] = LaifenData(entry.title, laifen, coordinator)
@@ -199,6 +310,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         laifens.append(laifen)
         laifen.device_asleep = False
 
+        if low_traffic:
+            _arm_low_traffic(hass, entry, coordinator, laifen, restored if isinstance(restored, dict) else None)
+            continue
 
         if ble_device and await laifen.connect():
             await laifen.start_notifications()
@@ -232,9 +346,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_stop(hass: HomeAssistant, event: Event) -> None:
-    """Close all connections on shutdown."""
-    laifens = hass.data.get(DOMAIN, {}).get("laifens", [])
+    """Close connections on shutdown.
+
+    An opted-in entry whose last status is Running does not get an
+    explicit disconnect here. The process exit still drops the socket;
+    skipping the call avoids adding a motor-stop disconnect on top.
+    """
+    domain = hass.data.get(DOMAIN, {})
+    laifens = domain.get("laifens", [])
+    held = domain.setdefault("held_links", {})
+    snapshots = domain.setdefault("low_traffic_snapshots", {})
+    seen: set[int] = set()
     for laifen in laifens:
+        if laifen is None or id(laifen) in seen:
+            continue
+        seen.add(id(laifen))
+        monitor = getattr(getattr(laifen, "coordinator", None), "monitor", None)
+        if monitor is not None:
+            await monitor.async_unload(held, snapshots)
+            continue
         await laifen.stop_notifications()
         await laifen.disconnect()
 
@@ -246,6 +376,15 @@ async def _async_device_recovery(hass: HomeAssistant, entry: ConfigEntry, servic
 
     device_address = service_info.device.address
     _LOGGER.debug(f"Bluetooth recovery callback fired for {device_address}")
+
+    if not advertisement_should_connect(_entry_low_traffic(entry), False):
+        # Advertisements are not a battery source. Connecting on each one
+        # is the recovery loop low-traffic mode is meant to stop.
+        _LOGGER.debug(
+            "Low-traffic mode: ignoring advertisement from %s (no connect)",
+            device_address,
+        )
+        return
 
     entry_devices: dict[str, LaifenData] = hass.data[DOMAIN][entry.entry_id]
 
@@ -293,20 +432,28 @@ async def _async_device_recovery(hass: HomeAssistant, entry: ConfigEntry, servic
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
-    data_dict = hass.data[DOMAIN].get(entry.entry_id, {})
-    for dev_addr, data in data_dict.items():
-        if isinstance(data, LaifenData):
-            await data.coordinator.async_request_refresh()
-        else:
-            _LOGGER.debug(f"Skipping refresh for unexpected object {dev_addr}: {type(data)}")
+    """Reload this entry after its options change.
+
+    Reloading rebuilds the coordinator interval and the low-traffic timer.
+    It reloads only this config entry, not Home Assistant Core and not the
+    other toothbrush entry. Saving the form while status is Running can
+    still drop a link at reload time; do it while the brush is idle.
+    """
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry and disconnect all devices."""
-    entry_devices = hass.data[DOMAIN].get(entry.entry_id, {})
+    """Unload a config entry and disconnect devices that are safe to drop."""
+    domain = hass.data[DOMAIN]
+    entry_devices = domain.get(entry.entry_id, {})
+    held = domain.setdefault("held_links", {})
+    snapshots = domain.setdefault("low_traffic_snapshots", {})
     for addr, data in entry_devices.items():
         if isinstance(data, LaifenData):
+            monitor = getattr(data.coordinator, "monitor", None)
+            if monitor is not None:
+                await monitor.async_unload(held, snapshots)
+                continue
             try:
                 await data.device.stop_notifications()
                 await data.device.disconnect()
@@ -314,5 +461,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception as e:
                 _LOGGER.debug(f"Error disconnecting {addr}: {e}")
 
-    hass.data[DOMAIN].pop(entry.entry_id, None)
+    domain.pop(entry.entry_id, None)
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

@@ -16,6 +16,17 @@
       }
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Laifen BLE options",
+        "description": "Low-traffic battery monitoring applies only to this config entry. It reads battery occasionally over GATT and does not use the normal one-second Bluetooth session. Leave it off for every other toothbrush. Battery can stay at the last known value for hours, and a sleeping brush may not answer.",
+        "data": {
+          "low_traffic_battery_mode": "Low-traffic battery monitoring"
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "status": {

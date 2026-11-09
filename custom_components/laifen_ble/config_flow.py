@@ -8,7 +8,7 @@ from typing import Any
 from homeassistant import config_entries
 from homeassistant.components import bluetooth
 from homeassistant.data_entry_flow import FlowResult
-from .const import DOMAIN
+from .const import CONF_LOW_TRAFFIC_BATTERY, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,3 +75,39 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle user-selected device registration."""
         selected_address = user_input["mac_address"]
         return self.async_create_entry(title=f"Laifen Toothbrush ({selected_address})", data={"devices": [selected_address]})
+
+    @staticmethod
+    def async_get_options_flow(config_entry):
+        """Per-entry options. The checkbox defaults to off."""
+        flow = LaifenOptionsFlow()
+        flow._entry = config_entry
+        return flow
+
+
+class LaifenOptionsFlow(config_entries.OptionsFlow):
+    """Enable low-traffic battery monitoring on this entry only.
+
+    ``OptionsFlow`` is constructed with no arguments so newer Home Assistant
+    releases, which set ``config_entry`` themselves, and older releases,
+    which pass the entry into ``async_get_options_flow``, both work.
+    """
+
+    def _current_entry(self):
+        entry = getattr(self, "_entry", None)
+        if entry is not None:
+            return entry
+        return self.config_entry
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        entry = self._current_entry()
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+        current = bool(entry.options.get(CONF_LOW_TRAFFIC_BATTERY, False))
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_LOW_TRAFFIC_BATTERY, default=current): bool,
+                }
+            ),
+        )

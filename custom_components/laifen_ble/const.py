@@ -12,8 +12,11 @@ class LaifenSensorEntityDescription(SensorEntityDescription):
     unique_id: str | None = None
 
 DOMAIN = "laifen_ble"
+# Default coordinator period. Unchanged for every entry that does not opt in.
 UPDATE_SECONDS = 1
 DEVICE_TIMEOUT = 15
+# Per config entry. Absent or false keeps the existing BLE behaviour.
+CONF_LOW_TRAFFIC_BATTERY = "low_traffic_battery_mode"
 
 SENSOR_TYPES = [
     LaifenSensorEntityDescription(

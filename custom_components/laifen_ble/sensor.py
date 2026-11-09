@@ -14,6 +14,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import DOMAIN, SENSOR_TYPES
+from .low_traffic import sensor_refresh_allowed
 from .models import LaifenData, DEVICE_REGISTRY, DEVICE_SIGNAL
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,11 +45,21 @@ class LaifenSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
         await super().async_added_to_hass()
         self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
 
-        # Start periodic updates for timer logic
+        # Start periodic updates for timer logic.
+        # Low-traffic entries do not ask the coordinator to refresh: that
+        # one-second refresh is what kept the reconnect path hot. The
+        # synthetic timer still ticks locally for this sensor only.
         from datetime import timedelta
-        self.async_on_remove(
-            async_track_time_interval(self.hass, self.async_update, timedelta(seconds=1))
-        )
+        if sensor_refresh_allowed(getattr(self.coordinator, "low_traffic", False)):
+            self.async_on_remove(
+                async_track_time_interval(self.hass, self.async_update, timedelta(seconds=1))
+            )
+        elif self.entity_description.key == "timer":
+            self.async_on_remove(
+                async_track_time_interval(
+                    self.hass, self._async_low_traffic_timer, timedelta(seconds=1)
+                )
+            )
 
         # Restore state if device result is missing (e.g. HA just restarted)
         if not self.device.result:
@@ -86,10 +97,11 @@ class LaifenSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
         except asyncio.CancelledError:
             pass
 
-    async def async_update(self, *args):
-        """Update the sensor state from the coordinator."""
-        await self.coordinator.async_request_refresh()
+    async def _async_low_traffic_timer(self, *args):
+        """Advance the local timer without a coordinator or BLE refresh."""
+        self._sync_timer_task()
 
+    def _sync_timer_task(self) -> None:
         if self.device.result is not None:
             status = self.device.result.get("status")
 
@@ -107,6 +119,11 @@ class LaifenSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
                         self._timer_task.cancel()
                         self._timer_task = None
                         asyncio.create_task(self._hold_timer())
+
+    async def async_update(self, *args):
+        """Update the sensor state from the coordinator."""
+        await self.coordinator.async_request_refresh()
+        self._sync_timer_task()
 
     @property
     def available(self) -> bool:

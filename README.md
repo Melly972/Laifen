@@ -81,6 +81,10 @@ Then, add the integration via:
 3. Restart Home Assistant.
 4. Go to **Settings > Devices & Services > Add Integration > Laifen**
 
+## Low-traffic battery monitoring
+
+Version 3.0.4 still polls about once a second unless a config entry opts in. The optional mode is off by default and is per entry, so one toothbrush can be quiet while the other stays on the existing Bluetooth session. It is an experiment: status is taken from the existing notification parser, not from a proven one-shot GATT read, and it has not been tried on a brush. See [docs/low-traffic-battery-mode.md](docs/low-traffic-battery-mode.md). Do not enable it on a live Home Assistant until that note's hardware checks have been done.
+
 ## Notes
 
 - The integration stores the last known state of the device.
